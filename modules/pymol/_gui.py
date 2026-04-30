@@ -866,6 +866,7 @@ class PyMOLDesktopGUI(object):
             ('menu', 'Plugin', []),
             ('menu', 'AI', [
                 ('command', 'AI Assistant...', self.open_ai_panel),
+                ('command', 'AI Settings...', self.open_ai_settings),
             ]),
             ('menu', 'Help', [
                 ('command', 'PyMOL Home Page', lambda: webbrowser.open("http://www.pymol.org")),

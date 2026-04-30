@@ -907,6 +907,10 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         self.ai_panel.show()
         self.ai_panel.raise_()
 
+    def open_ai_settings(self):
+        self.open_ai_panel()
+        self.ai_panel.open_settings()
+
     def show_about(self):
         msg = [
             'The PyMOL Molecular Graphics System\n',

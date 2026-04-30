@@ -41,6 +41,23 @@ class _AgentWorker(QtCore.QThread):
             self.error.emit(str(exc))
 
 
+class _ModelDiscoveryWorker(QtCore.QThread):
+    """Loads model options without blocking the Qt UI."""
+
+    finished = QtCore.Signal(object)    # emits list[AIModelOption]
+    error = QtCore.Signal(str)
+
+    def __init__(self, agent, parent=None):
+        super().__init__(parent)
+        self._agent = agent
+
+    def run(self):
+        try:
+            self.finished.emit(self._agent.list_models())
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Collapsible action log widget
 # ---------------------------------------------------------------------------
@@ -266,6 +283,8 @@ class _AIPanelWidget(QtWidgets.QWidget):
         self._cmd = cmd
         self._worker = None
         self._agent = None
+        self._settings_dialog = None
+        self._model_available = True
         self._current_actions: "_CollapsibleActions | None" = None
         self._current_reasoning: "_CollapsibleReasoning | None" = None
         self._last_reasoning: "_CollapsibleReasoning | None" = None
@@ -286,29 +305,6 @@ class _AIPanelWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
-
-        # --- Toolbar ---
-        toolbar = QtWidgets.QHBoxLayout()
-        toolbar.setSpacing(6)
-
-        reasoning_label = QtWidgets.QLabel("Reasoning:")
-        reasoning_label.setStyleSheet("color: #aaa; font-size: 11px;")
-        toolbar.addWidget(reasoning_label)
-
-        self._reasoning_combo = QtWidgets.QComboBox()
-        self._reasoning_combo.addItems(["high", "medium", "low", "none"])
-        self._reasoning_combo.setCurrentText("high")
-        self._reasoning_combo.setFixedWidth(80)
-        self._reasoning_combo.setStyleSheet(
-            "QComboBox { font-size: 11px; background-color: #2a2a2a; color: #ddd; border: 1px solid #555; border-radius: 3px; padding: 1px 4px; }"
-            "QComboBox::drop-down { border: none; }"
-            "QComboBox QAbstractItemView { background-color: #2a2a2a; color: #ddd; selection-background-color: #444; }"
-        )
-        self._reasoning_combo.currentTextChanged.connect(self._on_reasoning_mode_changed)
-        toolbar.addWidget(self._reasoning_combo)
-        toolbar.addStretch()
-
-        layout.addLayout(toolbar)
 
         # --- Chat history area ---
         self._scroll_area = QtWidgets.QScrollArea()
@@ -366,8 +362,7 @@ class _AIPanelWidget(QtWidgets.QWidget):
         if self._init_error:
             self._add_bubble(
                 f"Error initializing AI agent: {self._init_error}\n\n"
-                "Make sure 'openai' is installed (pip install openai) and "
-                "OPENAI_API_KEY is set.",
+                "Make sure 'openai' is installed (pip install openai).",
                 "system",
             )
             self._input.setEnabled(False)
@@ -393,6 +388,9 @@ class _AIPanelWidget(QtWidgets.QWidget):
         text = self._input.toPlainText().strip()
         if not text or self._worker is not None:
             return
+        if not self._model_available:
+            self._status_label.setText("Choose an available AI model from AI > AI Settings...")
+            return
 
         self._input.clear()
         self._add_bubble(text, "user")
@@ -408,10 +406,6 @@ class _AIPanelWidget(QtWidgets.QWidget):
         self._worker.reasoning.connect(self._on_reasoning)
         self._worker.error.connect(self._on_agent_error)
         self._worker.start()
-
-    def _on_reasoning_mode_changed(self, mode: str):
-        if self._agent:
-            self._agent.set_reasoning_effort(mode)
 
     def _on_cancel(self):
         if self._agent:
@@ -495,10 +489,229 @@ class _AIPanelWidget(QtWidgets.QWidget):
         """Toggle between idle state (Send visible) and running state (Cancel visible)."""
         self._input.setEnabled(not running)
         self._send_btn.setVisible(not running)
+        self._send_btn.setEnabled(not running and self._model_available)
         self._cancel_btn.setVisible(running)
         self._cancel_btn.setEnabled(running)
         self._clear_btn.setEnabled(not running)
-        self._reasoning_combo.setEnabled(not running)
+
+    def is_running(self) -> bool:
+        return self._worker is not None
+
+    def agent(self):
+        return self._agent
+
+    def set_model_available(self, available: bool, message: str = ""):
+        self._model_available = available
+        self._send_btn.setEnabled(available and self._worker is None)
+        self._status_label.setText(message)
+
+    def open_settings(self):
+        if self._settings_dialog is None:
+            self._settings_dialog = _AISettingsDialog(self, self)
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
+        self._settings_dialog.activateWindow()
+
+
+class _AISettingsDialog(QtWidgets.QDialog):
+    """Dialog for configuring the AI provider, model, key, and reasoning mode."""
+
+    def __init__(self, panel: _AIPanelWidget, parent=None):
+        super().__init__(parent)
+        self._panel = panel
+        self._agent = panel.agent()
+        self._model_worker = None
+        self._model_worker_provider = None
+        self.setWindowTitle("AI Settings")
+        self.setMinimumWidth(420)
+        self._build_ui()
+        self._load_current_settings()
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(8)
+
+        self._local_toggle = QtWidgets.QCheckBox("Use local Ollama")
+        self._local_toggle.setToolTip("Use locally installed Ollama models")
+        self._local_toggle.toggled.connect(self._on_local_toggled)
+        form.addRow("Provider:", self._local_toggle)
+
+        model_row = QtWidgets.QHBoxLayout()
+        model_row.setSpacing(6)
+        self._model_combo = QtWidgets.QComboBox()
+        self._model_combo.setMinimumWidth(250)
+        self._model_combo.currentIndexChanged.connect(self._on_model_changed)
+        model_row.addWidget(self._model_combo, stretch=1)
+
+        self._refresh_models_btn = QtWidgets.QPushButton("Refresh")
+        self._refresh_models_btn.clicked.connect(self._refresh_models)
+        model_row.addWidget(self._refresh_models_btn)
+        form.addRow("Model:", model_row)
+
+        self._api_key_edit = QtWidgets.QLineEdit()
+        self._api_key_edit.setPlaceholderText("sk-...")
+        self._api_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self._api_key_edit.editingFinished.connect(self._on_api_key_changed)
+        form.addRow("OpenAI key:", self._api_key_edit)
+
+        self._reasoning_combo = QtWidgets.QComboBox()
+        self._reasoning_combo.addItems(["high", "medium", "low", "none"])
+        self._reasoning_combo.currentTextChanged.connect(self._on_reasoning_mode_changed)
+        form.addRow("Reasoning:", self._reasoning_combo)
+
+        layout.addLayout(form)
+
+        self._status_label = QtWidgets.QLabel("")
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet("color: #aaa; font-style: italic; font-size: 11px;")
+        layout.addWidget(self._status_label)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.hide)
+        layout.addWidget(buttons)
+
+    def _load_current_settings(self):
+        if not self._agent:
+            self._set_controls_enabled(False)
+            self._status_label.setText("AI agent is not available.")
+            return
+
+        self._api_key_edit.setText(getattr(self._agent, "_api_key", ""))
+        self._reasoning_combo.setCurrentText(getattr(self._agent, "_reasoning_effort", "high"))
+        self._local_toggle.setChecked(self._agent.get_provider() == "ollama")
+        self._model_combo.addItem(self._agent.get_model(), self._agent.get_model())
+        self._sync_controls()
+
+    def _set_controls_enabled(self, enabled: bool):
+        self._local_toggle.setEnabled(enabled)
+        self._model_combo.setEnabled(enabled)
+        self._refresh_models_btn.setEnabled(enabled)
+        self._api_key_edit.setEnabled(enabled)
+        self._reasoning_combo.setEnabled(enabled)
+
+    def _sync_controls(self):
+        running = self._panel.is_running()
+        provider = self._agent.get_provider() if self._agent else "openai"
+        can_edit = not running and self._agent is not None
+        self._local_toggle.setEnabled(can_edit)
+        self._model_combo.setEnabled(can_edit)
+        self._refresh_models_btn.setEnabled(can_edit and self._model_worker is None)
+        self._api_key_edit.setEnabled(can_edit and provider == "openai")
+        self._reasoning_combo.setEnabled(can_edit and provider == "openai")
+        if running:
+            self._status_label.setText("AI settings are locked while the assistant is running.")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_controls()
+
+    def _on_api_key_changed(self):
+        if self._agent and self._agent.get_provider() == "openai":
+            self._agent.set_api_key(self._api_key_edit.text())
+
+    def _on_local_toggled(self, checked: bool):
+        if not self._agent or self._panel.is_running():
+            return
+        self._on_api_key_changed()
+        self._agent.set_provider("ollama" if checked else "openai")
+        self._sync_controls()
+        self._refresh_models()
+
+    def _on_model_changed(self, index: int):
+        if not self._agent or index < 0:
+            return
+        model_id = self._model_combo.itemData(index)
+        if model_id:
+            self._agent.set_model(model_id)
+            self._panel.set_model_available(True)
+
+    def _on_reasoning_mode_changed(self, mode: str):
+        if self._agent:
+            self._agent.set_reasoning_effort(mode)
+
+    def _refresh_models(self):
+        if not self._agent or self._model_worker is not None or self._panel.is_running():
+            return
+        self._on_api_key_changed()
+        self._status_label.setText("Loading models...")
+        self._refresh_models_btn.setEnabled(False)
+        self._model_worker_provider = self._agent.get_provider()
+        self._model_worker = _ModelDiscoveryWorker(self._agent, self)
+        self._model_worker.finished.connect(self._on_models_loaded)
+        self._model_worker.error.connect(self._on_models_error)
+        self._model_worker.start()
+
+    def _on_models_loaded(self, options):
+        worker_provider = self._model_worker_provider
+        self._model_worker = None
+        self._model_worker_provider = None
+        provider = self._agent.get_provider() if self._agent else "openai"
+        if worker_provider and worker_provider != provider:
+            self._sync_controls()
+            return
+
+        self._model_combo.blockSignals(True)
+        self._model_combo.clear()
+        for option in options:
+            self._model_combo.addItem(option.label, option.id)
+
+        if not options:
+            if provider == "ollama":
+                self._model_combo.addItem("No local vision+tools models", "")
+                self._panel.set_model_available(
+                    False,
+                    "No installed Ollama models advertise both vision and tools.",
+                )
+                self._status_label.setText("No installed Ollama models advertise both vision and tools.")
+            else:
+                model_id = self._agent.get_model() or "gpt-5.4"
+                self._model_combo.addItem(model_id, model_id)
+                self._agent.set_model(model_id)
+                self._panel.set_model_available(True)
+                self._status_label.setText("No OpenAI models returned; keeping the current model.")
+        else:
+            current = self._agent.get_model()
+            index = self._model_combo.findData(current)
+            if index < 0:
+                index = 0
+            self._model_combo.setCurrentIndex(index)
+            model_id = self._model_combo.itemData(index)
+            if model_id:
+                self._agent.set_model(model_id)
+            self._panel.set_model_available(True)
+            self._status_label.setText("")
+
+        self._model_combo.blockSignals(False)
+        self._sync_controls()
+
+    def _on_models_error(self, error_msg: str):
+        worker_provider = self._model_worker_provider
+        self._model_worker = None
+        self._model_worker_provider = None
+        provider = self._agent.get_provider() if self._agent else "openai"
+        if worker_provider and worker_provider != provider:
+            self._sync_controls()
+            return
+
+        self._model_combo.blockSignals(True)
+        self._model_combo.clear()
+        if self._agent and provider == "openai":
+            model_id = self._agent.get_model() or "gpt-5.4"
+            self._model_combo.addItem(model_id, model_id)
+            self._panel.set_model_available(True)
+        else:
+            self._model_combo.addItem("No local vision+tools models", "")
+            self._panel.set_model_available(False, f"Model refresh failed: {error_msg}")
+        self._model_combo.blockSignals(False)
+        self._status_label.setText(f"Model refresh failed: {error_msg}")
+        self._sync_controls()
 
 
 # ---------------------------------------------------------------------------
@@ -514,5 +727,8 @@ class AIPanel(QtWidgets.QDockWidget):
         self.setMinimumWidth(280)
         self.setMaximumWidth(500)
 
-        inner = _AIPanelWidget(parent.cmd, self)
-        self.setWidget(inner)
+        self._inner = _AIPanelWidget(parent.cmd, self)
+        self.setWidget(self._inner)
+
+    def open_settings(self):
+        self._inner.open_settings()

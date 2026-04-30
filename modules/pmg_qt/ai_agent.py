@@ -10,9 +10,21 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Callable
 
 _IMAGE_PREFIX = "__IMAGE__:"
+_DEFAULT_OPENAI_MODEL = "gpt-5.4"
+_DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+
+
+@dataclass(frozen=True)
+class AIModelOption:
+    """A model option shown in the Qt model picker."""
+
+    id: str
+    label: str
+    provider: str
 
 # Path to the extracted PyMOL command documentation text file
 _DOCS_PATH = os.path.join(os.path.dirname(__file__), "..", "pymol", "data", "pymol_cmds.txt")
@@ -223,17 +235,29 @@ class AIAgent:
     within a session.
     """
 
-    def __init__(self, cmd, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        cmd,
+        api_key: Optional[str] = None,
+        provider: str = "openai",
+        model: Optional[str] = None,
+        ollama_base_url: str = _DEFAULT_OLLAMA_BASE_URL,
+    ):
         """
         Args:
             cmd: The PyMOL cmd module (from parent.cmd in the Qt panel)
             api_key: OpenAI API key. Falls back to OPENAI_API_KEY env var.
+            provider: "openai" or "ollama".
+            model: Model id to use. Falls back to a provider-specific default.
+            ollama_base_url: Base URL for the local Ollama server.
         """
         self.cmd = cmd
         self._messages: List[Dict[str, Any]] = []
         self._client = None
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
-        self._model = "gpt-5.4"
+        self._provider = provider
+        self._model = model or _DEFAULT_OPENAI_MODEL
+        self._ollama_base_url = ollama_base_url.rstrip("/")
         self._reasoning_effort = "high"  # "high" | "medium" | "low" | "none"
         self._cancelled = False
 
@@ -246,12 +270,136 @@ class AIAgent:
                     "The 'openai' package is required. "
                     "Install it with: pip install openai"
                 ) from e
+            if self._provider == "ollama":
+                self._client = OpenAI(
+                    api_key="ollama",
+                    base_url=f"{self._ollama_base_url}/v1",
+                )
+                return self._client
+
             if not self._api_key:
                 raise RuntimeError(
-                    "No OpenAI API key found. Set the OPENAI_API_KEY environment variable."
+                    "No OpenAI API key found. Enter one in the AI panel or set "
+                    "the OPENAI_API_KEY environment variable."
                 )
             self._client = OpenAI(api_key=self._api_key)
         return self._client
+
+    # ------------------------------------------------------------------
+    # Model discovery and configuration
+    # ------------------------------------------------------------------
+
+    def set_provider(self, provider: str):
+        """Set the model provider: 'openai' or 'ollama'."""
+        if provider not in ("openai", "ollama"):
+            raise ValueError(f"Unknown AI provider: {provider}")
+        if provider != self._provider:
+            self._provider = provider
+            self._client = None
+            self.clear_history()
+
+    def set_api_key(self, api_key: str):
+        """Set the OpenAI API key used for future OpenAI requests."""
+        api_key = (api_key or "").strip()
+        if api_key != self._api_key:
+            self._api_key = api_key
+            self._client = None
+
+    def set_model(self, model: str):
+        """Set the active model id."""
+        model = (model or "").strip()
+        if model and model != self._model:
+            self._model = model
+            self.clear_history()
+
+    def get_model(self) -> str:
+        """Return the active model id."""
+        return self._model
+
+    def get_provider(self) -> str:
+        """Return the active provider id."""
+        return self._provider
+
+    def list_openai_models(self) -> List[AIModelOption]:
+        """
+        Return OpenAI models visible to the configured API key.
+
+        The OpenAI models endpoint does not expose per-model vision/tool metadata,
+        so all available model ids are returned and sorted with current GPT models
+        first. Unsupported model selections surface a normal API error on send.
+        """
+        client = self._get_client()
+        models = []
+        for item in client.models.list():
+            model_id = getattr(item, "id", None)
+            if model_id:
+                models.append(str(model_id))
+        if not models:
+            return []
+
+        def sort_key(model_id: str):
+            preferred = model_id.startswith(("gpt-5", "gpt-4.1", "gpt-4o"))
+            return (0 if preferred else 1, model_id.lower())
+
+        return [
+            AIModelOption(id=model_id, label=model_id, provider="openai")
+            for model_id in sorted(set(models), key=sort_key)
+        ]
+
+    def list_ollama_models(self) -> List[AIModelOption]:
+        """
+        Return locally installed Ollama models that advertise both vision and
+        tool-calling support via /api/show capabilities.
+        """
+        tags_url = f"{self._ollama_base_url}/api/tags"
+        try:
+            with urllib.request.urlopen(tags_url, timeout=5) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Could not connect to Ollama at {self._ollama_base_url}: {e.reason}") from e
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Ollama returned invalid model list JSON: {e}") from e
+
+        options: List[AIModelOption] = []
+        for item in payload.get("models", []):
+            model_id = item.get("model") or item.get("name")
+            if not model_id:
+                continue
+            capabilities = self._get_ollama_capabilities(model_id)
+            if {"vision", "tools"}.issubset(capabilities):
+                options.append(
+                    AIModelOption(
+                        id=model_id,
+                        label=f"{model_id}  (vision, tools)",
+                        provider="ollama",
+                    )
+                )
+        return sorted(options, key=lambda option: option.id.lower())
+
+    def _get_ollama_capabilities(self, model_id: str) -> set:
+        body = json.dumps({"model": model_id}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self._ollama_base_url}/api/show",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, json.JSONDecodeError):
+            return set()
+
+        capabilities = payload.get("capabilities") or []
+        if isinstance(capabilities, list):
+            return {str(item).lower() for item in capabilities}
+        return set()
+
+    def list_models(self) -> List[AIModelOption]:
+        """Return model options for the current provider."""
+        if self._provider == "ollama":
+            return self.list_ollama_models()
+        return self.list_openai_models()
 
     # ------------------------------------------------------------------
     # Tool implementations
@@ -561,13 +709,19 @@ class AIAgent:
             if self._cancelled:
                 raise InterruptedError("Cancelled by user.")
 
-            response = client.responses.create(
-                model=self._model,
-                instructions=SYSTEM_PROMPT,
-                tools=TOOLS,
-                input=input_messages,
-                reasoning={"effort": self._reasoning_effort, "summary": "auto"} if self._reasoning_effort != "none" else None,
-            )
+            request = {
+                "model": self._model,
+                "instructions": SYSTEM_PROMPT,
+                "tools": TOOLS,
+                "input": input_messages,
+            }
+            if self._provider == "openai" and self._reasoning_effort != "none":
+                request["reasoning"] = {
+                    "effort": self._reasoning_effort,
+                    "summary": "auto",
+                }
+
+            response = client.responses.create(**request)
 
             # Emit reasoning summaries before processing tool calls
             if on_reasoning:
