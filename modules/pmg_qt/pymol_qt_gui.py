@@ -107,6 +107,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.shortcut_menu_filter_dialog = None
         self.scene_panel_dialog = None
         self.ai_panel = None
+        self.casp_toolbar = None
+        self._casp_restore_state = None
 
         # setting index -> callable
         self.setting_callbacks = defaultdict(list)
@@ -270,6 +272,8 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
                     btn.released.connect(callback)
 
             quickbuttonslayout.addLayout(hbox)
+
+        self._setup_casp_toolbar(cmd)
 
         # progress bar
         hbox = QtWidgets.QHBoxLayout()
@@ -910,6 +914,154 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
     def open_ai_settings(self):
         self.open_ai_panel()
         self.ai_panel.open_settings()
+
+    def _setup_casp_toolbar(self, cmd):
+        toolbar = self.addToolBar('CASP17')
+        toolbar.setObjectName('casp17_toolbar')
+
+        mode_action = SettingAction(
+            self, cmd, 'casp_submission_mode', 'CASP Mode')
+        mode_action.setToolTip(
+            'Highlight the first five public molecule objects for CASP17')
+        toolbar.addAction(mode_action)
+
+        group_action = QtWidgets.QAction('Group ID...', self)
+        group_action.setToolTip('Configure the CASP group ID used for submissions')
+        group_action.triggered.connect(self.configure_casp_group_id)
+        toolbar.addAction(group_action)
+
+        submit_action = QtWidgets.QAction('Submit to CASP', self)
+        submit_action.setToolTip(
+            'Submit the first five public molecule objects to CASP17')
+        submit_action.triggered.connect(self.open_casp_submission_dialog)
+        toolbar.addAction(submit_action)
+
+        index = cmd.setting._get_index('casp_submission_mode')
+        submit_action.setEnabled(bool(cmd.get_setting_int('casp_submission_mode')))
+        self.setting_callbacks[index].append(
+            lambda v: submit_action.setEnabled(bool(v)))
+
+        self.casp_toolbar = toolbar
+        self.casp_group_action = group_action
+        self.casp_submit_action = submit_action
+
+    @PopupOnException.decorator
+    def configure_casp_group_id(self, _checked=False):
+        from pymol import casp17
+
+        current_group_id = casp17.get_group_id(self.cmd)
+        group_id, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            'CASP17 Group ID',
+            'Group ID',
+            text=current_group_id)
+        if not accepted:
+            return
+
+        try:
+            casp17.set_group_id(group_id, self.cmd)
+        except casp17.CASPSubmissionError as e:
+            QtWidgets.QMessageBox.warning(self, 'CASP17 Group ID', str(e))
+
+    @PopupOnException.decorator
+    def open_casp_submission_dialog(self, _checked=False):
+        from pymol import casp17
+
+        model_names = casp17.get_ranked_model_names(self.cmd)
+        try:
+            casp17.validate_model_names(model_names)
+        except casp17.CASPSubmissionError as e:
+            QtWidgets.QMessageBox.warning(self, 'CASP17 Submission', str(e))
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle('Submit to CASP17')
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        form = QtWidgets.QFormLayout()
+        target_input = QtWidgets.QLineEdit()
+        target_input.setPlaceholderText('H1312')
+        group_input = QtWidgets.QLineEdit()
+        group_input.setText(casp17.get_group_id(self.cmd))
+        group_input.setPlaceholderText('Required')
+        email_input = QtWidgets.QLineEdit()
+        form.addRow('Target ID', target_input)
+        form.addRow('Group ID', group_input)
+        form.addRow('Email', email_input)
+        layout.addLayout(form)
+
+        model_list = QtWidgets.QListWidget()
+        model_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        for index, name in enumerate(model_names[:5], start=1):
+            model_list.addItem('%d. %s' % (index, name))
+        layout.addWidget(model_list)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok).setText('Submit')
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        target_id = target_input.text()
+        group_id = group_input.text()
+        email = email_input.text()
+
+        QtWidgets.QApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor)
+        try:
+            group_id = casp17.set_group_id(group_id, self.cmd)
+            result = casp17.build_current_submission(
+                target_id, group_id=group_id, _self=self.cmd)
+            result['response_text'] = casp17.submit_to_casp(
+                result['output_path'], email)
+            self._casp_restore_state = casp17.prepare_grid_preview(
+                result['model_names'], self.cmd)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, 'CASP17 Submission Failed', str(e))
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        self._show_casp_submission_success(result)
+
+    def _show_casp_submission_success(self, result):
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle('CASP17 Submission')
+        box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        box.setText('CASP17 submission complete.')
+        model_order = '\n'.join(
+            '%d. %s' % (index, name)
+            for index, name in enumerate(result['model_names'], start=1))
+        box.setInformativeText(
+            'Group ID: %s\n\nSaved file:\n%s\n\nSubmitted models:\n%s' %
+            (result['group_id'], result['output_path'], model_order))
+
+        response_text = result.get('response_text') or ''
+        if response_text:
+            box.setDetailedText(response_text)
+
+        restore_button = box.addButton(
+            'Restore Previous View', QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Close)
+        box.exec()
+
+        if box.clickedButton() is restore_button:
+            self._restore_casp_preview()
+
+    def _restore_casp_preview(self):
+        from pymol import casp17
+
+        if self._casp_restore_state is not None:
+            casp17.restore_grid_preview(self._casp_restore_state, self.cmd)
+            self._casp_restore_state = None
 
     def show_about(self):
         msg = [

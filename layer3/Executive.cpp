@@ -16158,6 +16158,10 @@ void CExecutive::draw(CGO* orthoCGO)
   int arrows = SettingGetGlobal_b(G, cSetting_group_arrow_prefix);
   auto name_color_mode =
       SettingGet<int>(G, cSetting_internal_gui_name_color_mode);
+  int casp_submission_mode =
+      SettingGetGlobal_b(G, cSetting_casp_submission_mode);
+  int casp_model_count = 0;
+  float caspSubmissionColor[3] = {0.85F, 0.05F, 0.05F};
 
   ExecutiveUpdatePanelList(G);
 
@@ -16253,6 +16257,12 @@ void CExecutive::draw(CGO* orthoCGO)
     for (auto& panelitem : I->Panel) {
       auto* const panel = &panelitem;
       rec = panel->spec;
+      bool casp_submission_model = false;
+      if (casp_submission_mode && rec->type == cExecObject && rec->obj &&
+          rec->obj->type == cObjectMolecule && rec->name[0] != '_') {
+        casp_model_count++;
+        casp_submission_model = casp_model_count <= 5;
+      }
       {
         if (skip) {
           skip--;
@@ -16421,6 +16431,10 @@ void CExecutive::draw(CGO* orthoCGO)
                   } else {
                     but_color = cloakedColor;
                   }
+                }
+
+                if (casp_submission_model) {
+                  but_color = caspSubmissionColor;
                 }
 
                 draw_button(x3, y2, but_width, (ExecLineHeight - 1), lightEdge,

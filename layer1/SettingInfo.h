@@ -906,6 +906,8 @@ enum {
   REC_b( 796, use_tessellation_shaders                , global    , true ),
   REC_c( 797, cell_color                              , ostate    , "-1" ),
   REC_i( 798, grid_label_size                          , global    , 14, 8, 36 ),
+  REC_b( 799, casp_submission_mode                    , global    , false ),
+  REC_s( 800, casp_group_id                           , global    , "" ),
 
 #ifdef SETTINGINFO_IMPLEMENTATION
 #undef SETTINGINFO_IMPLEMENTATION

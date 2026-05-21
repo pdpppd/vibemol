@@ -2154,6 +2154,9 @@ void SettingGenerateSideEffects(PyMOLGlobals * G, int index, const char *sele, i
     WizardRefresh(G);
     OrthoDirty(G);
     break;
+  case cSetting_casp_submission_mode:
+    OrthoDirty(G);
+    break;
   case cSetting_hide_underscore_names:
     ExecutiveInvalidateGroups(G, false);
     OrthoDirty(G);

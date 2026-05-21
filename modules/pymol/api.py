@@ -181,6 +181,10 @@ from .exporting import \
       save
 
 #--------------------------------------------------------------------
+from .casp17 import \
+      casp_submit
+
+#--------------------------------------------------------------------
 from . import editing
 from .editing import \
       add_bond,           \
