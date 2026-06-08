@@ -2155,6 +2155,11 @@ void SettingGenerateSideEffects(PyMOLGlobals * G, int index, const char *sele, i
     OrthoDirty(G);
     break;
   case cSetting_casp_submission_mode:
+#ifndef _PYMOL_NOPY
+    PParse(G, SettingGetGlobal_b(G, cSetting_casp_submission_mode) ?
+        "/cmd._casp_submission_mode_changed(1)" :
+        "/cmd._casp_submission_mode_changed(0)");
+#endif
     OrthoDirty(G);
     break;
   case cSetting_hide_underscore_names:

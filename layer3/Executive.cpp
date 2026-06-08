@@ -24,6 +24,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "pymol/type_traits.h"
@@ -126,6 +127,70 @@
 #define cTempRectSele "_rect"
 #define cLeftButSele "lb"
 #define cIndicateSele "indicate"
+
+static std::string pythonSingleQuotedString(const char* value)
+{
+  std::string result;
+  for (const char* ch = value; ch && *ch; ++ch) {
+    if (*ch == '\\' || *ch == '\'') {
+      result.push_back('\\');
+    }
+    result.push_back(*ch);
+  }
+  return result;
+}
+
+static void ExecutiveDispatchCaspPanelPick(PyMOLGlobals* G, const char* name)
+{
+#ifndef _PYMOL_NOPY
+  auto escaped = pythonSingleQuotedString(name);
+  auto command = pymol::string_format(
+      "/cmd._casp_object_panel_pick('%s')", escaped.c_str());
+  PParse(G, command.c_str());
+#endif
+}
+
+static bool ExecutiveHasCaspPanelPickButton(PyMOLGlobals* G)
+{
+#ifndef _PYMOL_NOPY
+  return SettingGetGlobal_b(G, cSetting_casp_submission_mode);
+#else
+  return false;
+#endif
+}
+
+static bool ExecutiveCanCaspPanelPick(PyMOLGlobals* G, const SpecRec* rec)
+{
+  return ExecutiveHasCaspPanelPickButton(G) && rec &&
+         rec->type == cExecObject && rec->obj &&
+         rec->obj->type == cObjectMolecule && rec->name[0] != '_';
+}
+
+static int ExecutiveGetCaspRankForName(PyMOLGlobals* G, const char* name)
+{
+  int rank = 0;
+#ifndef _PYMOL_NOPY
+  if (!ExecutiveHasCaspPanelPickButton(G) || !name || !G->P_inst ||
+      !G->P_inst->cmd) {
+    return rank;
+  }
+
+  int blocked = PAutoBlock(G);
+  PyObject* result = PYOBJECT_CALLMETHOD(
+      G->P_inst->cmd, "_casp_get_rank_for_model", "s", name);
+  if (result) {
+    if (!PConvPyObjectToInt(result, &rank)) {
+      rank = 0;
+      PyErr_Clear();
+    }
+    Py_DECREF(result);
+  } else {
+    PyErr_Clear();
+  }
+  PAutoUnblock(G, blocked);
+#endif
+  return rank;
+}
 
 #ifndef NO_MMLIBS
 #include "mmpymolx.h"
@@ -1764,6 +1829,8 @@ static int get_op_cnt(PyMOLGlobals* G)
   if (!strcmp(
           SettingGetGlobal_s(G, cSetting_button_mode_name), "3-Button Motions"))
     result = 6;
+  if (ExecutiveHasCaspPanelPickButton(G))
+    result++;
   return result;
 }
 
@@ -15024,6 +15091,13 @@ int CExecutive::click(int button, int x, int y, int mod)
 #endif
 
               t = (op_cnt - t) - 1;
+              if (ExecutiveHasCaspPanelPickButton(G) && t == op_cnt - 1) {
+                if (button == P_GLUT_LEFT_BUTTON && mod == 0 &&
+                    ExecutiveCanCaspPanelPick(G, rec)) {
+                  ExecutiveDispatchCaspPanelPick(G, rec->obj->Name);
+                }
+                break;
+              }
               switch (t) {
               case 0: /* action */
                 switch (rec->type) {
@@ -16142,6 +16216,9 @@ void CExecutive::draw(CGO* orthoCGO)
 #ifndef _PYMOL_NOPY
   float activeColor[3] = {0.9F, 0.9F, 1.0F};
   float toggleColor3[3] = {0.6F, 0.6F, 0.8F};
+  float caspPickColor[3] = {0.9F, 0.1F, 0.1F};
+  float caspPickDisabledColor[3] = {0.45F, 0.25F, 0.25F};
+  float caspRankColor[3] = {1.0F, 0.1F, 0.1F};
 #endif
 
   SpecRec* rec = nullptr;
@@ -16158,10 +16235,6 @@ void CExecutive::draw(CGO* orthoCGO)
   int arrows = SettingGetGlobal_b(G, cSetting_group_arrow_prefix);
   auto name_color_mode =
       SettingGet<int>(G, cSetting_internal_gui_name_color_mode);
-  int casp_submission_mode =
-      SettingGetGlobal_b(G, cSetting_casp_submission_mode);
-  int casp_model_count = 0;
-  float caspSubmissionColor[3] = {0.85F, 0.05F, 0.05F};
 
   ExecutiveUpdatePanelList(G);
 
@@ -16257,12 +16330,6 @@ void CExecutive::draw(CGO* orthoCGO)
     for (auto& panelitem : I->Panel) {
       auto* const panel = &panelitem;
       rec = panel->spec;
-      bool casp_submission_model = false;
-      if (casp_submission_mode && rec->type == cExecObject && rec->obj &&
-          rec->obj->type == cObjectMolecule && rec->name[0] != '_') {
-        casp_model_count++;
-        casp_submission_model = casp_model_count <= 5;
-      }
       {
         if (skip) {
           skip--;
@@ -16290,7 +16357,13 @@ void CExecutive::draw(CGO* orthoCGO)
 
             glColor3fv(toggleColor);
             for (a = 0; a < op_cnt; a++) {
-              switch (a) {
+              if (ExecutiveHasCaspPanelPickButton(G) && a == op_cnt - 1) {
+                float* button_color = ExecutiveCanCaspPanelPick(G, rec) ?
+                    caspPickColor : caspPickDisabledColor;
+                draw_button(x2, y2, ExecToggleSize, (ExecLineHeight - 1),
+                    toggleLightEdge, toggleDarkEdge, button_color, orthoCGO);
+                draw_button_char(G, x2, y2 + text_lift, 'R', orthoCGO);
+              } else switch (a) {
               case 0:
                 /*
                    glColor3fv(toggleColor);
@@ -16433,10 +16506,6 @@ void CExecutive::draw(CGO* orthoCGO)
                   }
                 }
 
-                if (casp_submission_model) {
-                  but_color = caspSubmissionColor;
-                }
-
                 draw_button(x3, y2, but_width, (ExecLineHeight - 1), lightEdge,
                     darkEdge, but_color, orthoCGO);
               }
@@ -16444,8 +16513,26 @@ void CExecutive::draw(CGO* orthoCGO)
               TextSetColor(G, getNameColor(rec->obj, name_color_mode, but_color,
                                   TextColor));
 
+              int casp_rank = 0;
+#ifndef _PYMOL_NOPY
+              if (ExecutiveCanCaspPanelPick(G, rec)) {
+                casp_rank = ExecutiveGetCaspRankForName(G, rec->obj->Name);
+              }
+              if (casp_rank > 0) {
+                TextSetColor(G, caspRankColor);
+                char rank_str[8];
+                snprintf(rank_str, sizeof(rank_str), "%d ", casp_rank);
+                for (char* sc = rank_str; *sc && nChar > 0; sc++) {
+                  TextDrawChar(G, *sc, orthoCGO);
+                  nChar--;
+                }
+                TextSetColor(G, getNameColor(rec->obj, name_color_mode,
+                    but_color, TextColor));
+              }
+#endif
+
               /* grid slot indicator */
-              if (rec->type == cExecObject &&
+              if (!casp_rank && rec->type == cExecObject &&
                   SettingGet<GridMode>(G, cSetting_grid_mode) ==
                       GridMode::ByObject &&
                   rec->obj->grid_slot > 0) {

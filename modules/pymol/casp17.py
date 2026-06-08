@@ -15,6 +15,9 @@ cmd = sys.modules["pymol.cmd"]
 
 DEFAULT_GROUP_ID = ""
 SUBMIT_URL = "https://predictioncenter.org/casp17/submit"
+RANK_COUNT = 5
+RANK_ATTR = "_casp17_ranked_model_names"
+MODE_ATTR = "_casp17_submission_mode_enabled"
 
 AA3 = {
     "ALA",
@@ -85,6 +88,212 @@ def set_group_id(group_id, _self=cmd):
     group_id = _normalize_group_id(group_id)
     _self.set("casp_group_id", group_id, log=1, quiet=0)
     return group_id
+
+
+def _state_owner(_self=cmd):
+    return getattr(_self, "_pymol", _self)
+
+
+def reset_ranked_model_names(_self=cmd):
+    ranked_model_names = [None] * RANK_COUNT
+    setattr(_state_owner(_self), RANK_ATTR, ranked_model_names)
+    return list(ranked_model_names)
+
+
+def _get_raw_ranked_model_names(_self=cmd):
+    owner = _state_owner(_self)
+    ranked_model_names = getattr(owner, RANK_ATTR, None)
+    if not isinstance(ranked_model_names, list) or len(ranked_model_names) != RANK_COUNT:
+        ranked_model_names = reset_ranked_model_names(_self)
+    return ranked_model_names
+
+
+def is_valid_model_name(model_name, _self=cmd):
+    if not model_name:
+        return False
+    try:
+        return (
+            model_name in _self.get_names("public_nongroup_objects") and
+            _self.get_type(model_name) == "object:molecule"
+        )
+    except Exception:
+        return False
+
+
+def clean_ranked_model_names(_self=cmd):
+    ranked_model_names = _get_raw_ranked_model_names(_self)
+    changed = False
+    seen = set()
+    for index, name in enumerate(list(ranked_model_names)):
+        if not is_valid_model_name(name, _self) or name in seen:
+            ranked_model_names[index] = None
+            changed = True
+            continue
+        seen.add(name)
+    if changed:
+        setattr(_state_owner(_self), RANK_ATTR, ranked_model_names)
+    return list(ranked_model_names)
+
+
+def get_ranked_model_names(_self=cmd):
+    return clean_ranked_model_names(_self)
+
+
+def get_rank_for_model(model_name, _self=cmd):
+    for index, name in enumerate(clean_ranked_model_names(_self), start=1):
+        if name == model_name:
+            return index
+    return 0
+
+
+def _casp_get_rank_for_model(model_name, _self=cmd):
+    for index, name in enumerate(_get_raw_ranked_model_names(_self), start=1):
+        if name == model_name:
+            return index
+    return 0
+
+
+def ranked_model_names_complete(_self=cmd):
+    return all(clean_ranked_model_names(_self))
+
+
+def assign_ranked_model(rank, model_name, _self=cmd):
+    try:
+        rank = int(rank)
+    except (TypeError, ValueError):
+        raise CASPSubmissionError("CASP rank must be a number from 1 to 5")
+
+    if rank < 1 or rank > RANK_COUNT:
+        raise CASPSubmissionError("CASP rank must be a number from 1 to 5")
+
+    if not is_valid_model_name(model_name, _self):
+        raise CASPSubmissionError(
+            'Object "%s" is not a public molecule object' % model_name
+        )
+
+    ranked_model_names = clean_ranked_model_names(_self)
+    ranked_model_names = [
+        None if name == model_name else name for name in ranked_model_names
+    ]
+    ranked_model_names[rank - 1] = model_name
+    setattr(_state_owner(_self), RANK_ATTR, ranked_model_names)
+    return list(ranked_model_names)
+
+
+def clear_ranked_model_rank(rank, _self=cmd):
+    try:
+        rank = int(rank)
+    except (TypeError, ValueError):
+        raise CASPSubmissionError("CASP rank must be a number from 1 to 5")
+
+    if rank < 1 or rank > RANK_COUNT:
+        raise CASPSubmissionError("CASP rank must be a number from 1 to 5")
+
+    ranked_model_names = clean_ranked_model_names(_self)
+    ranked_model_names[rank - 1] = None
+    setattr(_state_owner(_self), RANK_ATTR, ranked_model_names)
+    return list(ranked_model_names)
+
+
+def clear_ranked_model_name(model_name, _self=cmd):
+    ranked_model_names = clean_ranked_model_names(_self)
+    ranked_model_names = [
+        None if name == model_name else name for name in ranked_model_names
+    ]
+    setattr(_state_owner(_self), RANK_ATTR, ranked_model_names)
+    return list(ranked_model_names)
+
+
+def validate_model_names(model_names, _self=None):
+    model_names = list(model_names)
+    if len(model_names) < RANK_COUNT or any(not name for name in model_names[:RANK_COUNT]):
+        raise CASPSubmissionError(
+            "CASP17 submission mode requires five selected molecule objects"
+        )
+
+    model_names = model_names[:RANK_COUNT]
+    if len(set(model_names)) != RANK_COUNT:
+        raise CASPSubmissionError(
+            "CASP17 submission mode requires five unique selected molecule objects"
+        )
+
+    if _self is not None:
+        for name in model_names:
+            if not is_valid_model_name(name, _self):
+                raise CASPSubmissionError(
+                    'Object "%s" is not a public molecule object' % name
+                )
+
+    return model_names
+
+
+def get_validated_ranked_model_names(_self=cmd):
+    return validate_model_names(clean_ranked_model_names(_self), _self)
+
+
+def validate_preview_model_slots(model_names, _self=cmd):
+    model_names = list(model_names)
+    if len(model_names) > RANK_COUNT:
+        model_names = model_names[:RANK_COUNT]
+
+    slots = []
+    seen = set()
+    for rank, name in enumerate(model_names, start=1):
+        if not name:
+            continue
+        if name in seen:
+            raise CASPSubmissionError(
+                "CASP17 preview requires unique selected molecule objects"
+            )
+        if not is_valid_model_name(name, _self):
+            raise CASPSubmissionError(
+                'Object "%s" is not a public molecule object' % name
+            )
+        seen.add(name)
+        slots.append((rank, name))
+
+    if not slots:
+        raise CASPSubmissionError(
+            "CASP17 preview requires at least one selected molecule object"
+        )
+    return slots
+
+
+def get_preview_model_names(_self=cmd):
+    return [name for _, name in validate_preview_model_slots(
+        clean_ranked_model_names(_self), _self)]
+
+
+def handle_mode_change(enabled, _self=cmd):
+    owner = _state_owner(_self)
+    enabled = bool(int(enabled))
+    was_enabled = bool(getattr(owner, MODE_ATTR, False))
+    setattr(owner, MODE_ATTR, enabled)
+    if enabled and not was_enabled:
+        reset_ranked_model_names(_self)
+    return get_ranked_model_names(_self)
+
+
+def _casp_submission_mode_changed(enabled, _self=cmd):
+    return handle_mode_change(enabled, _self)
+
+
+def _casp_object_panel_pick(model_name, _self=cmd):
+    if not is_valid_model_name(model_name, _self):
+        return None
+
+    try:
+        from pymol import gui
+        window = gui.get_qtwindow()
+    except Exception:
+        window = None
+
+    if window is not None and hasattr(window, "handle_casp_object_panel_pick"):
+        return _self._call_in_gui_thread(
+            lambda: window.handle_casp_object_panel_pick(model_name))
+
+    setattr(_state_owner(_self), "_casp17_pending_model_name", model_name)
+    return model_name
 
 
 def is_atom_record(line):
@@ -190,24 +399,6 @@ def write_model(out, model_index, lines):
     print("END", file=out)
 
 
-def get_ranked_model_names(_self=cmd):
-    names = []
-    for name in _self.get_names("public_nongroup_objects"):
-        if _self.get_type(name) == "object:molecule":
-            names.append(name)
-            if len(names) == 5:
-                break
-    return names
-
-
-def validate_model_names(model_names):
-    if len(model_names) < 5:
-        raise CASPSubmissionError(
-            "CASP17 submission mode requires at least five public molecule objects"
-        )
-    return list(model_names[:5])
-
-
 def get_model_pdb_lines(model_name, _self=cmd):
     pdb = _self.get_pdbstr(model_name, state=-1, quiet=1)
     lines = pdb.splitlines()
@@ -256,8 +447,9 @@ def build_current_submission(target_id, output_path=None, model_names=None,
         group_id = get_group_id(_self, required=True)
     group_id = _normalize_group_id(group_id)
     if model_names is None:
-        model_names = get_ranked_model_names(_self)
-    model_names = validate_model_names(model_names)
+        model_names = get_validated_ranked_model_names(_self)
+    else:
+        model_names = validate_model_names(model_names, _self)
 
     if output_path is None:
         output_path = Path(os.getcwd()) / ("%s_TS_%s.pdb" % (target_id, group_id))
@@ -358,8 +550,25 @@ def submit_to_casp(output_path, email, url=SUBMIT_URL, opener=None, timeout=60):
     return response_text
 
 
+def apply_grid_preview(model_names, _self=cmd):
+    model_slots = validate_preview_model_slots(model_names, _self)
+    model_names = [name for _, name in model_slots]
+    all_objects = _self.get_names("public_nongroup_objects")
+    _self.set("grid_mode", 1, quiet=1)
+    for rank, name in model_slots:
+        _self.set("grid_slot", rank, name, quiet=1)
+        _self.enable(name)
+
+    submitted = set(model_names)
+    for name in all_objects:
+        if name not in submitted:
+            _self.disable(name)
+
+    _self.zoom(" ".join(model_names), animate=0)
+
+
 def prepare_grid_preview(model_names, _self=cmd):
-    model_names = list(model_names)
+    validate_preview_model_slots(model_names, _self)
     all_objects = _self.get_names("public_nongroup_objects")
     enabled_objects = set(_self.get_names("public_nongroup_objects", enabled_only=1))
     grid_slots = {}
@@ -376,17 +585,7 @@ def prepare_grid_preview(model_names, _self=cmd):
         "grid_slots": grid_slots,
     }
 
-    _self.set("grid_mode", 1, quiet=1)
-    for index, name in enumerate(model_names, start=1):
-        _self.set("grid_slot", index, name, quiet=1)
-        _self.enable(name)
-
-    submitted = set(model_names)
-    for name in all_objects:
-        if name not in submitted:
-            _self.disable(name)
-
-    _self.zoom(" ".join(model_names), animate=0)
+    apply_grid_preview(model_names, _self)
     return restore_state
 
 
@@ -411,7 +610,7 @@ def casp_submit(email, target_id, group_id=None, quiet=1, _self=cmd):
     """
 DESCRIPTION
 
-    Submit the top five public molecule objects in the object panel to CASP17.
+    Submit the selected top five ranked molecule objects to CASP17.
 
 USAGE
 

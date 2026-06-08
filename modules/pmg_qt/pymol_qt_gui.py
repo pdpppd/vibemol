@@ -48,6 +48,9 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
     _initialdir = ''
 
     def keyPressEvent(self, ev):
+        if self.handle_casp_rank_key(ev):
+            return
+
         args = keymapping.keyPressEventToPyMOLButtonArgs(ev)
 
         if args is not None:
@@ -109,6 +112,9 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.ai_panel = None
         self.casp_toolbar = None
         self._casp_restore_state = None
+        self._casp_pending_model_name = None
+        self.casp_rank_labels = []
+        self.casp_rank_clear_buttons = []
 
         # setting index -> callable
         self.setting_callbacks = defaultdict(list)
@@ -916,14 +922,70 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         self.ai_panel.open_settings()
 
     def _setup_casp_toolbar(self, cmd):
+        from pymol import casp17
+
         toolbar = self.addToolBar('CASP17')
         toolbar.setObjectName('casp17_toolbar')
 
+        mode_action = None
+
+        def mode_command():
+            value = 1 if mode_action.isChecked() else 0
+            cmd.set('casp_submission_mode', value, log=1, quiet=0)
+            self._handle_casp_mode_changed(value)
+
         mode_action = SettingAction(
-            self, cmd, 'casp_submission_mode', 'CASP Mode')
+            self, cmd, 'casp_submission_mode', 'CASP Mode',
+            command=mode_command)
         mode_action.setToolTip(
-            'Highlight the first five public molecule objects for CASP17')
+            'Build an explicit ranked CASP17 model list with object-panel R buttons')
         toolbar.addAction(mode_action)
+
+        rank_widget = QtWidgets.QWidget(self)
+        rank_widget.setObjectName('casp_rank_widget')
+        rank_layout = QtWidgets.QHBoxLayout(rank_widget)
+        rank_layout.setContentsMargins(4, 0, 4, 0)
+        rank_layout.setSpacing(2)
+        self.casp_rank_labels = []
+        self.casp_rank_clear_buttons = []
+        for index in range(1, casp17.RANK_COUNT + 1):
+            slot_widget = QtWidgets.QWidget(self)
+            slot_widget.setObjectName('casp_rank_slot_%d' % index)
+            slot_layout = QtWidgets.QHBoxLayout(slot_widget)
+            slot_layout.setContentsMargins(0, 0, 0, 0)
+            slot_layout.setSpacing(1)
+
+            label = QtWidgets.QLabel('%d. ' % index, slot_widget)
+            label.setObjectName('casp_rank_%d' % index)
+            label.setMinimumWidth(70)
+            label.setMaximumWidth(140)
+            label.setStyleSheet(
+                'QLabel { background: #d32323; color: white; padding: 2px 5px;'
+                ' border-radius: 2px; }')
+            slot_layout.addWidget(label)
+            self.casp_rank_labels.append(label)
+
+            clear_button = QtWidgets.QToolButton(slot_widget)
+            clear_button.setObjectName('casp_clear_rank_%d' % index)
+            clear_button.setText('x')
+            clear_button.setFixedWidth(18)
+            clear_button.setToolTip('Clear CASP rank %d' % index)
+            clear_button.setStyleSheet(
+                'QToolButton { background: #7f1717; color: white; padding: 0;'
+                ' border: 0; }'
+                'QToolButton:disabled { background: #4d2a2a; color: #999; }')
+            clear_button.clicked.connect(
+                lambda _checked=False, rank=index: self.clear_casp_rank(rank))
+            slot_layout.addWidget(clear_button)
+            self.casp_rank_clear_buttons.append(clear_button)
+
+            rank_layout.addWidget(slot_widget)
+        toolbar.addWidget(rank_widget)
+
+        preview_action = QtWidgets.QAction('Preview Selection', self)
+        preview_action.setToolTip('Show the ranked CASP17 models in grid view')
+        preview_action.triggered.connect(self.toggle_casp_preview)
+        toolbar.addAction(preview_action)
 
         group_action = QtWidgets.QAction('Group ID...', self)
         group_action.setToolTip('Configure the CASP group ID used for submissions')
@@ -932,18 +994,179 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
 
         submit_action = QtWidgets.QAction('Submit to CASP', self)
         submit_action.setToolTip(
-            'Submit the first five public molecule objects to CASP17')
+            'Submit the selected ranked molecule objects to CASP17')
         submit_action.triggered.connect(self.open_casp_submission_dialog)
         toolbar.addAction(submit_action)
 
         index = cmd.setting._get_index('casp_submission_mode')
-        submit_action.setEnabled(bool(cmd.get_setting_int('casp_submission_mode')))
-        self.setting_callbacks[index].append(
-            lambda v: submit_action.setEnabled(bool(v)))
+        self.setting_callbacks[index].append(self._handle_casp_mode_changed)
 
         self.casp_toolbar = toolbar
+        self.casp_mode_action = mode_action
+        self.casp_rank_widget = rank_widget
+        self.casp_preview_action = preview_action
         self.casp_group_action = group_action
         self.casp_submit_action = submit_action
+        self._handle_casp_mode_changed(cmd.get_setting_int('casp_submission_mode'))
+
+    def _handle_casp_mode_changed(self, value):
+        from pymol import casp17
+
+        enabled = bool(int(value))
+        casp17.handle_mode_change(enabled, self.cmd)
+
+        if not enabled:
+            self._casp_pending_model_name = None
+            if self._casp_restore_state is not None:
+                self._restore_casp_preview()
+
+        for label in self.casp_rank_labels:
+            label.setVisible(enabled)
+        for button in self.casp_rank_clear_buttons:
+            button.setVisible(enabled)
+        if hasattr(self, 'casp_rank_widget'):
+            self.casp_rank_widget.setVisible(enabled)
+        if hasattr(self, 'casp_preview_action'):
+            self.casp_preview_action.setVisible(enabled)
+        self._update_casp_rank_widgets()
+
+    def _update_casp_rank_widgets(self):
+        from pymol import casp17
+
+        enabled = bool(self.cmd.get_setting_int('casp_submission_mode'))
+        ranked_model_names = casp17.get_ranked_model_names(self.cmd)
+        complete = enabled and all(ranked_model_names)
+        has_selection = enabled and any(ranked_model_names)
+
+        for index, label in enumerate(self.casp_rank_labels, start=1):
+            name = ranked_model_names[index - 1]
+            label.setText('%d. %s' % (index, name or ''))
+            label.setToolTip(name or '')
+            if index <= len(self.casp_rank_clear_buttons):
+                self.casp_rank_clear_buttons[index - 1].setEnabled(
+                    enabled and bool(name))
+
+        if self._casp_restore_state is not None and not has_selection:
+            self._restore_casp_preview()
+            return
+
+        if hasattr(self, 'casp_preview_action'):
+            self.casp_preview_action.setEnabled(
+                has_selection or self._casp_restore_state is not None)
+            self.casp_preview_action.setText(
+                'Restore View' if self._casp_restore_state is not None
+                else 'Preview Selection')
+
+        if hasattr(self, 'casp_submit_action'):
+            self.casp_submit_action.setEnabled(complete)
+
+    def handle_casp_object_panel_pick(self, model_name):
+        from pymol import casp17
+
+        if not self.cmd.get_setting_int('casp_submission_mode'):
+            return None
+        if not casp17.is_valid_model_name(model_name, self.cmd):
+            return None
+
+        self._casp_pending_model_name = model_name
+        self.pymolwidget.setFocus()
+        self.statusBar().showMessage(
+            'CASP rank pending: %s. Press 1-5 to assign, 0/Delete to remove.' %
+            model_name, 5000)
+        return model_name
+
+    def handle_casp_rank_key(self, ev):
+        if not self._casp_pending_model_name:
+            return False
+
+        if ev.key() == Qt.Key.Key_Escape:
+            self._casp_pending_model_name = None
+            self.statusBar().clearMessage()
+            return True
+
+        text = ev.text()
+        clear_keys = (
+            Qt.Key.Key_Delete,
+            Qt.Key.Key_Backspace,
+        )
+        if text == '0' or ev.key() in clear_keys:
+            from pymol import casp17
+
+            model_name = self._casp_pending_model_name
+            self._casp_pending_model_name = None
+            self.statusBar().clearMessage()
+            casp17.clear_ranked_model_name(model_name, self.cmd)
+            self._handle_casp_rank_list_changed()
+            return True
+
+        if text in ('1', '2', '3', '4', '5'):
+            from pymol import casp17
+
+            model_name = self._casp_pending_model_name
+            self._casp_pending_model_name = None
+            self.statusBar().clearMessage()
+            try:
+                casp17.assign_ranked_model(int(text), model_name, self.cmd)
+                self._handle_casp_rank_list_changed()
+            except casp17.CASPSubmissionError as e:
+                QtWidgets.QMessageBox.warning(
+                    self, 'CASP17 Selection', str(e))
+            return True
+
+        self._casp_pending_model_name = None
+        self.statusBar().clearMessage()
+        return False
+
+    def _handle_casp_rank_list_changed(self):
+        from pymol import casp17
+
+        ranked_model_names = casp17.get_ranked_model_names(self.cmd)
+        if self._casp_restore_state is not None:
+            if any(ranked_model_names):
+                self._refresh_casp_preview()
+            else:
+                self._restore_casp_preview()
+                return
+        self._update_casp_rank_widgets()
+
+    @PopupOnException.decorator
+    def clear_casp_rank(self, rank):
+        from pymol import casp17
+
+        casp17.clear_ranked_model_rank(rank, self.cmd)
+        self._handle_casp_rank_list_changed()
+
+    @PopupOnException.decorator
+    def toggle_casp_preview(self, _checked=False):
+        from pymol import casp17
+
+        if self._casp_restore_state is not None:
+            self._restore_casp_preview()
+            return
+
+        try:
+            model_names = casp17.get_ranked_model_names(self.cmd)
+            self._casp_restore_state = casp17.prepare_grid_preview(
+                model_names, self.cmd)
+            self._set_casp_preview_border(True)
+        except casp17.CASPSubmissionError as e:
+            QtWidgets.QMessageBox.warning(self, 'CASP17 Preview', str(e))
+            return
+
+        self._update_casp_rank_widgets()
+
+    def _refresh_casp_preview(self):
+        from pymol import casp17
+
+        if self._casp_restore_state is None:
+            return
+        model_names = casp17.get_ranked_model_names(self.cmd)
+        casp17.apply_grid_preview(model_names, self.cmd)
+
+    def _set_casp_preview_border(self, enabled):
+        set_border = getattr(self.pymolwidget, 'set_casp_preview_border', None)
+        if set_border is not None:
+            set_border(enabled)
 
     @PopupOnException.decorator
     def configure_casp_group_id(self, _checked=False):
@@ -967,9 +1190,8 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
     def open_casp_submission_dialog(self, _checked=False):
         from pymol import casp17
 
-        model_names = casp17.get_ranked_model_names(self.cmd)
         try:
-            casp17.validate_model_names(model_names)
+            model_names = casp17.get_validated_ranked_model_names(self.cmd)
         except casp17.CASPSubmissionError as e:
             QtWidgets.QMessageBox.warning(self, 'CASP17 Submission', str(e))
             return
@@ -1021,8 +1243,6 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
                 target_id, group_id=group_id, _self=self.cmd)
             result['response_text'] = casp17.submit_to_casp(
                 result['output_path'], email)
-            self._casp_restore_state = casp17.prepare_grid_preview(
-                result['model_names'], self.cmd)
         except Exception as e:
             QtWidgets.QMessageBox.critical(
                 self, 'CASP17 Submission Failed', str(e))
@@ -1048,12 +1268,15 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         if response_text:
             box.setDetailedText(response_text)
 
-        restore_button = box.addButton(
-            'Restore Previous View', QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        restore_button = None
+        if self._casp_restore_state is not None:
+            restore_button = box.addButton(
+                'Restore Previous View',
+                QtWidgets.QMessageBox.ButtonRole.ActionRole)
         box.addButton(QtWidgets.QMessageBox.StandardButton.Close)
         box.exec()
 
-        if box.clickedButton() is restore_button:
+        if restore_button is not None and box.clickedButton() is restore_button:
             self._restore_casp_preview()
 
     def _restore_casp_preview(self):
@@ -1062,6 +1285,10 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         if self._casp_restore_state is not None:
             casp17.restore_grid_preview(self._casp_restore_state, self.cmd)
             self._casp_restore_state = None
+            self._set_casp_preview_border(False)
+            if hasattr(self, 'casp_preview_action'):
+                self.casp_preview_action.setText('Preview Selection')
+            self._update_casp_rank_widgets()
 
     def show_about(self):
         msg = [

@@ -182,6 +182,9 @@ from .exporting import \
 
 #--------------------------------------------------------------------
 from .casp17 import \
+      _casp_get_rank_for_model, \
+      _casp_object_panel_pick, \
+      _casp_submission_mode_changed, \
       casp_submit
 
 #--------------------------------------------------------------------

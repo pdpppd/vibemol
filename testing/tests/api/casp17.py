@@ -34,6 +34,13 @@ class FakeOpener:
 
 
 class TestCASP17(testing.PyMOLTestCase):
+    def load_ranked_models(self, names=("m1", "m2", "m3", "m4", "m5")):
+        casp17.reset_ranked_model_names(cmd)
+        for index, name in enumerate(names, start=1):
+            cmd.fragment("gly", name)
+            casp17.assign_ranked_model(index, name, cmd)
+        return list(names)
+
     def testWriteSubmission(self):
         model_lines = [
             [
@@ -71,24 +78,95 @@ class TestCASP17(testing.PyMOLTestCase):
                                         "H1312", filename,
                                         group_id="test-group")
 
-    def testRankedModelNamesUseFirstFiveMoleculesOnly(self):
-        from pymol import cgo
+    def testRankedModelNamesStartBlank(self):
+        casp17.reset_ranked_model_names(cmd)
+        self.assertEqual(casp17.get_ranked_model_names(cmd), [None] * 5)
+        with self.assertRaises(casp17.CASPSubmissionError):
+            casp17.get_validated_ranked_model_names(cmd)
 
-        for name in ["m1", "m2", "m3", "m4", "m5", "m6"]:
+    def testCaspModeEnableResetsRankList(self):
+        cmd.fragment("gly", "m1")
+        casp17.reset_ranked_model_names(cmd)
+        casp17.assign_ranked_model(1, "m1", cmd)
+        cmd.set("casp_submission_mode", 0)
+        self.assertEqual(casp17.get_ranked_model_names(cmd)[0], "m1")
+
+        try:
+            cmd.set("casp_submission_mode", 1)
+            self.assertEqual(casp17.get_ranked_model_names(cmd), [None] * 5)
+        finally:
+            cmd.set("casp_submission_mode", 0)
+
+    def testAssignRankedModels(self):
+        for name in ["m1", "m2", "m3"]:
             cmd.fragment("gly", name)
-        cmd.load_cgo([cgo.STOP], "cgo1")
-        cmd.order("m3 m1 cgo1 m2 m4 m5 m6", location="top")
+
+        casp17.reset_ranked_model_names(cmd)
+        casp17.assign_ranked_model(1, "m1", cmd)
+        casp17.assign_ranked_model(2, "m1", cmd)
+        self.assertEqual(
+            casp17.get_ranked_model_names(cmd),
+            [None, "m1", None, None, None])
+
+        casp17.assign_ranked_model(2, "m2", cmd)
+        self.assertEqual(
+            casp17.get_ranked_model_names(cmd),
+            [None, "m2", None, None, None])
+        self.assertEqual(casp17.get_rank_for_model("m2", cmd), 2)
+        self.assertEqual(cmd._casp_get_rank_for_model("m2"), 2)
+
+        with self.assertRaises(casp17.CASPSubmissionError):
+            casp17.assign_ranked_model(6, "m3", cmd)
+
+    def testClearRankedModels(self):
+        for name in ["m1", "m2"]:
+            cmd.fragment("gly", name)
+
+        casp17.reset_ranked_model_names(cmd)
+        casp17.assign_ranked_model(1, "m1", cmd)
+        casp17.assign_ranked_model(2, "m2", cmd)
+
+        casp17.clear_ranked_model_name("m1", cmd)
+        self.assertEqual(
+            casp17.get_ranked_model_names(cmd),
+            [None, "m2", None, None, None])
+
+        casp17.clear_ranked_model_rank(2, cmd)
+        self.assertEqual(casp17.get_ranked_model_names(cmd), [None] * 5)
+
+        with self.assertRaises(casp17.CASPSubmissionError):
+            casp17.clear_ranked_model_rank(6, cmd)
+
+    def testRankedModelValidationCleansInvalidObjects(self):
+        for name in ["m1", "m2"]:
+            cmd.fragment("gly", name)
+
+        casp17.reset_ranked_model_names(cmd)
+        casp17.assign_ranked_model(1, "m1", cmd)
+        casp17.assign_ranked_model(2, "m2", cmd)
+        cmd.delete("m1")
 
         self.assertEqual(
             casp17.get_ranked_model_names(cmd),
-            ["m3", "m1", "m2", "m4", "m5"])
+            [None, "m2", None, None, None])
+        with self.assertRaises(casp17.CASPSubmissionError):
+            casp17.get_validated_ranked_model_names(cmd)
+
+    def testObjectPanelPickStoresPendingModelWithoutQt(self):
+        cmd.fragment("gly", "m1")
+        self.assertEqual(casp17._casp_object_panel_pick("m1", cmd), "m1")
+        self.assertEqual(
+            getattr(cmd._pymol, "_casp17_pending_model_name", None), "m1")
+        self.assertIsNone(casp17._casp_object_panel_pick("missing", cmd))
 
     def testBuildCurrentSubmissionUsesRankedOrder(self):
         self.assertTrue(hasattr(cmd, "casp_submit"))
 
         for name in ["m1", "m2", "m3", "m4", "m5", "m6"]:
             cmd.fragment("gly", name)
-        cmd.order("m5 m4 m3 m2 m1 m6", location="top")
+        casp17.reset_ranked_model_names(cmd)
+        for index, name in enumerate(["m5", "m4", "m3", "m2", "m1"], start=1):
+            casp17.assign_ranked_model(index, name, cmd)
         cmd.set("casp_group_id", "test-group")
 
         with testing.mktemp(".pdb") as filename:
@@ -101,8 +179,7 @@ class TestCASP17(testing.PyMOLTestCase):
     def testGroupIDSettingDrivesBuildSubmission(self):
         cmd.set("casp_group_id", "configured-group_2")
 
-        for name in ["m1", "m2", "m3", "m4", "m5"]:
-            cmd.fragment("gly", name)
+        self.load_ranked_models()
 
         with testing.mktemp(".pdb") as filename:
             result = casp17.build_current_submission("T1234", filename, _self=cmd)
@@ -115,12 +192,54 @@ class TestCASP17(testing.PyMOLTestCase):
     def testGroupIDSettingIsRequiredForBuildSubmission(self):
         cmd.set("casp_group_id", "")
 
-        for name in ["m1", "m2", "m3", "m4", "m5"]:
-            cmd.fragment("gly", name)
+        self.load_ranked_models()
 
         with testing.mktemp(".pdb") as filename:
             with self.assertRaises(casp17.CASPSubmissionError):
                 casp17.build_current_submission("T1234", filename, _self=cmd)
+
+    def testPrepareAndRestoreGridPreview(self):
+        ranked = self.load_ranked_models()
+        cmd.fragment("gly", "m6")
+        cmd.disable("m6")
+        cmd.set("grid_mode", 0)
+        cmd.set("grid_slot", 4, "m1")
+
+        restore_state = casp17.prepare_grid_preview(ranked, cmd)
+
+        self.assertEqual(cmd.get_setting_int("grid_mode"), 1)
+        self.assertEqual(
+            set(cmd.get_names("public_nongroup_objects", enabled_only=1)),
+            set(ranked))
+        self.assertEqual(cmd.get_setting_int("grid_slot", "m3"), 3)
+
+        casp17.restore_grid_preview(restore_state, cmd)
+
+        self.assertEqual(cmd.get_setting_int("grid_mode"), 0)
+        self.assertNotIn(
+            "m6", cmd.get_names("public_nongroup_objects", enabled_only=1))
+        self.assertEqual(cmd.get_setting_int("grid_slot", "m1"), 4)
+
+    def testPartialGridPreviewUsesAssignedRankSlots(self):
+        for name in ["m1", "m2", "m3"]:
+            cmd.fragment("gly", name)
+        casp17.reset_ranked_model_names(cmd)
+        casp17.assign_ranked_model(2, "m1", cmd)
+        casp17.assign_ranked_model(4, "m2", cmd)
+
+        restore_state = casp17.prepare_grid_preview(
+            casp17.get_ranked_model_names(cmd), cmd)
+
+        self.assertEqual(cmd.get_setting_int("grid_mode"), 1)
+        self.assertEqual(
+            set(cmd.get_names("public_nongroup_objects", enabled_only=1)),
+            {"m1", "m2"})
+        self.assertEqual(cmd.get_setting_int("grid_slot", "m1"), 2)
+        self.assertEqual(cmd.get_setting_int("grid_slot", "m2"), 4)
+        with self.assertRaises(casp17.CASPSubmissionError):
+            casp17.prepare_grid_preview([None] * 5, cmd)
+
+        casp17.restore_grid_preview(restore_state, cmd)
 
     def testCustomGroupID(self):
         model_lines = [[atom_line(index)] for index in range(1, 6)]
@@ -168,5 +287,19 @@ class TestCASP17(testing.PyMOLTestCase):
 
         from pmg_qt import pymol_qt_gui
 
+        self.assertTrue(hasattr(cmd, "_casp_object_panel_pick"))
+        self.assertTrue(hasattr(cmd, "_casp_submission_mode_changed"))
         self.assertTrue(
             hasattr(pymol_qt_gui.PyMOLQtGUI, "open_casp_submission_dialog"))
+        self.assertTrue(
+            hasattr(pymol_qt_gui.PyMOLQtGUI, "handle_casp_object_panel_pick"))
+        self.assertTrue(
+            hasattr(pymol_qt_gui.PyMOLQtGUI, "handle_casp_rank_key"))
+        self.assertTrue(
+            hasattr(pymol_qt_gui.PyMOLQtGUI, "toggle_casp_preview"))
+        self.assertTrue(
+            hasattr(pymol_qt_gui.PyMOLQtGUI, "clear_casp_rank"))
+
+        from pmg_qt import pymol_gl_widget
+        self.assertTrue(
+            hasattr(pymol_gl_widget.PyMOLGLWidget, "set_casp_preview_border"))

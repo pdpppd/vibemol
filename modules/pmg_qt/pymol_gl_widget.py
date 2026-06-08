@@ -10,6 +10,7 @@ from pymol.Qt import QtWidgets
 Gesture = QtCore.QEvent.Type.Gesture
 Qt = QtCore.Qt
 
+from . import keymapping
 from .keymapping import get_modifiers
 from .keymapping import get_wheel_button
 
@@ -64,6 +65,7 @@ class PyMOLGLWidget(BaseGLWidget):
     def __init__(self, parent):
         self.gui = parent
         self.fb_scale = 1.0
+        self._casp_preview_border = False
 
         # OpenGL context setup
         if USE_QOPENGLWIDGET:
@@ -187,6 +189,14 @@ class PyMOLGLWidget(BaseGLWidget):
     def mouseReleaseEvent(self, ev):
         self.mousePressEvent(ev, 1)
 
+    def keyPressEvent(self, ev):
+        if self.gui.handle_casp_rank_key(ev):
+            return
+
+        args = keymapping.keyPressEventToPyMOLButtonArgs(ev)
+        if args is not None:
+            self.pymol.button(*args)
+
     def wheelEvent(self, ev):
         button = get_wheel_button(ev)
         if not button:
@@ -194,6 +204,10 @@ class PyMOLGLWidget(BaseGLWidget):
         args = self._event_x_y_mod(ev)
         self.pymol.button(button, 0, *args)
         self.pymol.button(button, 1, *args)
+
+    def set_casp_preview_border(self, enabled):
+        self._casp_preview_border = bool(enabled)
+        self.update()
 
     ##########################
     # OpenGL
@@ -204,6 +218,18 @@ class PyMOLGLWidget(BaseGLWidget):
             glViewport(0, 0, int(self.fb_scale * self.width()),
                          int(self.fb_scale * self.height()))
         self.pymol.draw()
+        if self._casp_preview_border:
+            painter = QtGui.QPainter(self)
+            try:
+                pen = QtGui.QPen(QtGui.QColor('#d32323'))
+                pen.setWidth(4)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                inset = pen.width() // 2
+                painter.drawRect(self.rect().adjusted(
+                    inset, inset, -inset, -inset))
+            finally:
+                painter.end()
         self._timer.start(0)
 
     def resizeGL(self, w, h):

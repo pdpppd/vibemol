@@ -317,6 +317,11 @@ with a slash (/) forces the interpreter to pass it to Python. See also the
         # first we need to import a set of symbols into the local namespace
 
         from .api import *
+        from . import casp17 as _casp17
+
+        _casp_object_panel_pick = _casp17._casp_object_panel_pick
+        _casp_get_rank_for_model = _casp17._casp_get_rank_for_model
+        _casp_submission_mode_changed = _casp17._casp_submission_mode_changed
 
         # deferred initialization
 
