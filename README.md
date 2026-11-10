@@ -42,15 +42,17 @@ PY
 
 ## AI Setup
 
-Install the OpenAI client library:
+Install the client library for the provider you want to use. `keyring` is
+optional and lets PyMOL remember your API keys in the system keychain; without
+it, keys last until PyMOL closes.
 
 ```bash
-pip install openai
+pip install openai anthropic keyring
 ```
 
 Then launch PyMOL and open:
 
-- `AI -> AI Settings...` to choose the provider/model and enter an OpenAI API key
+- `AI -> AI Settings...` to choose the provider/model and enter an API key
 - `AI -> AI Assistant...` to open the chat panel
 
 ![AI settings dialog](docs/images/ai-settings-dialog.png)
@@ -66,6 +68,15 @@ export OPENAI_API_KEY=your_api_key_here
 Click `Refresh` to load the OpenAI models available to that key, then choose a
 model from the picker.
 
+### Anthropic Claude
+
+Choose `Anthropic Claude` as the provider in `AI Settings`, then enter your API
+key or set it before launching PyMOL:
+
+```bash
+export ANTHROPIC_API_KEY=your_api_key_here
+```
+
 ### Local Ollama
 
 Start Ollama locally:
@@ -74,13 +85,14 @@ Start Ollama locally:
 ollama serve
 ```
 
-Install a model that supports both vision and tools, then enable `Use local
-Ollama` in `AI Settings`. The picker only shows installed Ollama models whose
+Install a model that supports both vision and tools, then choose `Local
+Ollama` as the provider in `AI Settings`. The picker only shows installed Ollama models whose
 metadata advertises both `vision` and `tools`.
 
 ## Use The Assistant
 
-Open `AI -> AI Assistant...`, type a request, and click `Send`.
+Open `AI -> AI Assistant...`, type a request, and press Enter. Shift+Enter adds
+a new line, and the Up and Down arrows recall earlier messages.
 
 ![AI assistant panel](docs/images/ai-assistant-panel.png)
 
@@ -89,13 +101,26 @@ The assistant can:
 - inspect the current PyMOL scene
 - run PyMOL commands
 - capture the viewport for visual context
-- search the Protein Data Bank
+- inspect selections and measure distances, angles, dihedrals and contacts
+- search the Protein Data Bank and UniProt
+- load predicted structures from AlphaFold DB
 - look up bundled PyMOL command documentation
+
+The panel also has:
+
+- preset prompts for common views
+- `Undo AI turn`, which restores the scene to before the last AI turn
+- `Export .pml`, which saves the commands the AI ran as a script
+- a request for approval before risky commands, such as deleting objects,
+  overwriting files, or running Python. This is a guardrail and not a sandbox
+- drag and drop to load structure files
+- a token count for the last turn and the session
 
 ## Useful Files
 
 - AI chat UI: `modules/pmg_qt/ai_panel.py`
 - AI tool loop and model discovery: `modules/pmg_qt/ai_agent.py`
+- Claude provider: `modules/pmg_qt/ai_provider_claude.py`
 - Qt menu entry: `modules/pymol/_gui.py`
 
 ## License
